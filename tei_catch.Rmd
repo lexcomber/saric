@@ -1,0 +1,351 @@
+---
+title: "Teifi Runoff Risk: Catchment model"
+output: 
+  flexdashboard::flex_dashboard:
+    orientation: rows
+    vertical_layout: fill
+runtime: shiny
+---
+
+```{r setup, include=FALSE}
+library(leaflet)
+library(shiny)
+#library(highcharter)
+library(flexdashboard)
+library(repmis)
+library(sp)
+library(rgdal)
+library(RColorBrewer)
+library(ggplot2)
+library(dygraphs)
+library(reshape2)
+
+# save(list = c("df","host","CN","wis", "df.abs", "riv", "df.stations"),file = "wis_catch.RData")
+#load("wis_catch.RData")
+# source_data("https://github.com/lexcomber/saricsupport/blob/master/wis_catch.RData?raw=True")
+#os.proj <- CRS("+proj=tmerc +lat_0=49 +lon_0=-2 +k=0.9996012717 +x_0=400000 +y_0=-100000 +ellps=airy +datum=OSGB36 +units=m +no_defs ")
+#crs.val <- CRS("+proj=longlat +datum=WGS84 +no_defs +ellps=WGS84 +towgs84=0,0,0")
+#df.sp <- SpatialPointsDataFrame(cbind(df$EASTING, df$NORTHING), data = data.frame(df),
+#                                proj4string = os.proj)
+#df.p <- as(df.sp, "SpatialPixelsDataFrame")
+#df.pol <- as(df.p, "SpatialPolygonsDataFrame")
+#df <- spTransform(df.pol, crs.val)
+# save(list = c("df","host","CN","wis", "df.abs", "riv", "df.stations"),file = "wis_catch2.RData")
+load("tei_catch2.RData")
+
+
+```
+Column {.sidebar}
+-----------------------------------------------------------------------
+```{r}
+# selectInput widget 1
+crop.type <- c("Metaldehyde", "Acid Herbicide")
+selectInput("crop_choice", label = h3("Select Application"),
+            choices = crop.type, selected = "Acid Herbicide")
+# selectInput widget 2
+soil.qual <- c("Good", "Poor")
+selectInput("soil_qual", label = h3("Select Soil Status"),
+            choices = soil.qual, selected = "Poor")
+# selectInput widget 3
+# value is always yyyy-mm-dd, even if the display format is different
+dateInput("date_choice", h3("Select a date:"), 
+          max = Sys.Date()+4, min = "2017-10-01",
+          value = Sys.Date())
+```
+
+**Notes** 
+
+Select a **date** - this can any date between October 2017 and the next 5 days (ie today + 4 days). 
+
+The map will display the run off risk for that day, crop and soil condition, for each $1km^2$ cell. These have been categorised but if you _hover_ your mouse over the cells the load value (kg/ha) is displayed. Loadings are calculated for each of land use in each $1km^2$ cell. The boxplots show the distributions of rainfall for the selected date and the 5 preceding days. A graph of rainfall for this period in this area is also shown.
+
+This is part of the a SARIC funded project _Real-time predictions of pesticide run-off risk: multi-scale visualisations of water quality risks and costs_, being undertaken by Rothamsted Research, Cranfield University, the University of Leeds and Bangor University. Please contact Lex Comber for further information to provide any feedback (a.comber@leeds.ac.uk).
+
+
+Column {data-width=650}
+-----------------------------------------------------------------------
+
+### Water Quality Risk
+
+```{r}
+
+output$map <- renderLeaflet({
+  
+  if (input$crop_choice == "Metaldehyde") kd = 67
+  if (input$crop_choice == "Acid Herbicide") kd = 20
+  
+  if (input$soil_qual == "Good") lut_index = 2
+  if (input$soil_qual == "Poor") lut_index = 3
+  
+  # set coeffs
+  lambdaV = 0.05 # constant 
+  
+  # need to add selected wd to df 
+  # "today" - ie day of prediction - TestDaily
+  # "sum5 days" - ie sum of previous 5 days rainfall
+  # day.chosen <- which(input$day_choice == days)
+  
+  date.chosen <- input$date_choice
+  #date.chosen <- Sys.Date()-102
+  #date.chosen <- as.Date("2018-01-12")
+  
+  # https://www.geog.leeds.ac.uk/projects/saric/Lex/Teifi/l/2018-06/2018-06-07/2018-06-07.csv
+  # https://www.geog.leeds.ac.uk/projects/saric/Lex/Wissey/l/2018-06/2018-06-07/2018-06-07.csv
+  # tit1 <- "https://www.geog.leeds.ac.uk/projects/saric/Lex/Wissey/l/2018-06/2018-06-07/2018-06-07.csv"
+  get.weather.data <- function(date.chosen) {
+    # based on the observed rainfall yesterday (2018-06-07) 
+    # giving a forecast for today (2018-06-08).
+    month.i <- format(date.chosen,"%Y-%m")
+    tit <- 
+      paste0("http://www.geog.leeds.ac.uk/projects/saric/Lex/Teifi/l/", 
+             month.i,"/",
+             date.chosen, "/",
+             date.chosen,".csv")
+    wd <- read.csv(tit) 
+    wd$GridCode = paste0(substr(wd$Easting,1,3),substr(wd$Northing, 1,3))
+    index <- match(df$GridCode, wd$GridCode)
+    wd <- wd[index,]
+    # 2. selecting rainfall data
+    wd <- wd[,7:21]
+    # 3. renaming data
+    days1 <- c(date.chosen-10, date.chosen-9, date.chosen-8, date.chosen-7, date.chosen-6,
+           date.chosen-5, date.chosen-4, date.chosen-3, date.chosen-2, date.chosen-1,
+           date.chosen, date.chosen+1, date.chosen+2, date.chosen+3, date.chosen+4) 
+    days2 <- weekdays(as.Date(days1))
+    days <- paste(days2,days1)
+    names(wd) <- days
+    return(wd)
+  }
+  
+  #date.chosen <- Sys.Date()+2
+  flag = NULL
+  if( date.chosen > Sys.Date()) {
+    flag <- date.chosen
+    date.chosen <- Sys.Date()
+  }
+  if (is.null(flag)) {
+    wd.anal <- get.weather.data(date.chosen)
+    index <- grep(date.chosen, names(wd.anal))
+    df$Today <- wd.anal[,index]
+    df$Past5Days <- rowSums(wd.anal[, (index-5):(index-1)], na.rm = T)
+  }
+  if (!is.null(flag)) {
+    wd.anal <- get.weather.data(date.chosen)
+    index <- grep(flag, names(wd.anal))
+    df$Today <- wd.anal[,index]
+    df$Past5Days <- rowSums(wd.anal[, (index-5):(index-1)], na.rm = T)
+  }
+ 
+  # Output Koc
+  koc.func <- function(OC) {
+    if (OC >= 60) {
+      koc_F = 1
+    } else {
+      koc_F = 1 / (1+kd * OC / 100)
+    }
+    return(koc_F)}
+  df$koc_F <-sapply(df$OC, koc.func)
+  
+  # 1 Grass 2 Row.crops 3 Small.grains 4 Semi.natural 5 Woodland
+  day5.Q.func <- function(CN.val, daily.rain = data.i$Today, rain5days = data.i$Past5Days, 
+                          lambda =  lambdaV) {
+    S = 25400 / CN.val - 254
+    Ia = lambda * S
+    if( daily.rain >= Ia & rain5days >= Ia) {
+      M = 0.5 * (-1 * (1 + lambda) + sqrt((1 - lambda) ^ 2 * S ^ 2 + 4 * rain5days * S))
+      Q5days_m = (daily.rain - Ia) * (daily.rain - Ia + M) / (daily.rain - Ia + M + S)
+    } else {
+      Q5days_m = 0
+    }
+    return(Q5days_m)}
+  
+  ### OutputQ
+  flowQ.func <- function() {
+    df$Q_f <- 0
+    for ( i in 1:nrow(df) ) {
+      data.i <- df@data[i, ]
+      CNgrp <- (host[match(data.i$HOST, host[,1]),2] * 10)
+      Q.j <- 0
+      for (j in 1:5) {
+        CNgrp.j <- CNgrp + j
+        #### Devel 2: select Poor or Good -> 2 or 3
+        CN.val <- CN[match(CNgrp.j, CN[,1]),lut_index]  
+        res.j <-  day5.Q.func(CN.val, data.i$Today, 
+                              data.i$Past5Days, lambdaV )
+        res.j <- res.j * data.i[, (j+10)]
+        Q.j <- Q.j + res.j
+      }
+      Q.j <- Q.j / sum(data.i[, 11:15])
+      df$Q_f[i] <- Q.j
+    }
+    return(df$Q_f)}
+  df$Q_f <- flowQ.func()
+
+  # Loading to river 
+  load.func <- function(){
+    for ( i in 1:nrow(df) ) {
+      data.i <- df[i,]
+      tmp <- data.i$Source.load * data.i$koc_F * data.i$Q_f / data.i$Today
+      if (is.na(tmp)) tmp <- 0
+      tmp2 <- tmp * data.i$Surface_ratio * data.i$Surface.CI2 
+      tmp3 <- tmp * data.i$Drain_ratio * data.i$Drain.CI 
+      df$load[i] <- tmp2 + tmp3  
+    }
+  return(df$load)}
+  df$load <- load.func()
+
+  #pal <- colorNumeric((c("#1B7837", "#F7F7F7", "#762A83")), df$load,
+  #                  na.color = "transparent")
+  
+  #pal <- colorQuantile(
+  #  palette = brewer.pal(5, "Reds"),
+  #  domain = df$load)
+  df$load.orig <- df$load  
+  cat.var <- character(length(df$load))
+  cat.var[df$load == 0] <- "None" 
+  cat.var[df$load > 0 & df$load <= 0.02] <- "Low (<0.02)" 
+  cat.var[df$load > 0.02 & df$load < 0.05] <- "Moderate (<0.05)" 
+  cat.var[df$load > 0.05 ] <- "High (>0.05)" 
+  df$load <- cat.var
+
+  pal <- colorFactor(
+    palette = (brewer.pal(4, "RdYlGn")[c(1,3,2,4)]),
+    domain = factor(c("None", "Low (<0.02)", "Moderate (<0.05)","High (>0.05)")), 
+    ordered = T)
+  
+  vals <- factor(c("None", "Low (<0.02)", "Moderate (<0.05)","High (>0.05)"))
+  # Leaflet mapping of data polys
+  leaflet(df) %>% 
+    addTiles() %>%
+    addPolygons(data=tei, stroke = T, weight = 2, fill = F, color = "black") %>%
+  
+    addPolylines(data = riv, weight = 2) %>%
+    
+    
+    addPolygons(data = df,
+                stroke = T, 
+                color = "grey",
+                weight = 1,
+                smoothFactor = 0.5,
+                fillOpacity = 0.6,
+                opacity = 0.2, 
+                fillColor = ~pal(load),
+                # label = ~paste0(GridCode, ":", formatC(load, big.mark = ",")),
+                label = ~paste0(formatC(load.orig, big.mark = ",")),
+                layerId = ~df$GridCode) %>%
+    addLegend(pal = pal, values = df$load, 
+              #labFormat = function(type, vals){return(vals[c(1:4)])},
+            title = "Risk", position = "bottomleft") 
+
+    #addLegend(position = "bottomleft",
+    #          pal = pal, values = df$load, 
+    #          title = "Risk", opacity = 1, 
+    #          labFormat = function(type, cuts, p) { 
+    #            n = length(cuts) 
+    #            cuts[n] = "more" 
+    #            for (i in 2:(n-1)){
+    #              cuts[i] = ""
+    #            }
+    #            cuts[1] = "less" 
+    #            paste0(cuts[-n], cuts[-1])})
+
+})
+
+# Then declare and publish the MAP output
+leafletOutput('map', width = "100%", height = 600)  
+
+```
+
+
+
+Column {data-height=300}
+-----------------------------------------------------------------------
+
+### Daily rainfall for selected day + 5 previous days
+
+```{r}
+library(ggplot2)
+library(reshape2)
+renderPlot({
+
+  date.chosen <- input$date_choice
+  
+  get.weather.data <- function(date.chosen) {
+    # based on the observed rainfall yesterday (2018-06-07) 
+    # giving a forecast for today (2018-06-08).
+    month.i <- format(date.chosen,"%Y-%m")
+    tit <- 
+      paste0("http://www.geog.leeds.ac.uk/projects/saric/Lex/Teifi/l/", 
+             month.i,"/",
+             date.chosen, "/",
+             date.chosen,".csv")
+    wd <- read.csv(tit) 
+    wd$GridCode = paste0(substr(wd$Easting,1,3),substr(wd$Northing, 1,3))
+    index <- match(df$GridCode, wd$GridCode)
+    wd <- wd[index,]
+    # 2. selecting rainfall data
+    wd <- wd[,6:21]
+    # 3. renaming data
+    days1 <- c(date.chosen-10, date.chosen-9, date.chosen-8, date.chosen-7, date.chosen-6,
+           date.chosen-5, date.chosen-4, date.chosen-3, date.chosen-2, date.chosen-1,
+           date.chosen, date.chosen+1, date.chosen+2, date.chosen+3, date.chosen+4) 
+    days2 <- weekdays(as.Date(days1))
+    days <- paste(days2,days1)
+    names(wd) <- days
+    return(wd)
+  }
+  flag = NULL
+  if( date.chosen > Sys.Date()) {
+    flag <- date.chosen
+    date.chosen <- Sys.Date()
+  }
+  if (is.null(flag)) {
+    wd.anal <- get.weather.data(date.chosen)
+    index <- grep(date.chosen, names(wd.anal))
+    df.tmp <- data.frame(wd.anal[, (index-5):(index-1)], wd.anal[,index])
+    t1 <- as.vector(sapply(sapply(names(wd.anal)[(index-5):(index-1)], 
+                          function(x) strsplit(x," ")), "[[", 2))
+    t2 <- as.vector(sapply(sapply(names(wd.anal)[index], 
+                          function(x) strsplit(x," ")), "[[", 2))
+    names(df.tmp) <- append(t1, t2)
+  }
+  if (!is.null(flag)) {
+    wd.anal <- get.weather.data(date.chosen)
+    index <- grep(flag, names(wd.anal))
+    df.tmp <- data.frame(wd.anal[, (index-5):(index-1)], wd.anal[,index])
+    t1 <- as.vector(sapply(sapply(names(wd.anal)[(index-5):(index-1)], 
+                          function(x) strsplit(x," ")), "[[", 2))
+    t2 <- as.vector(sapply(sapply(names(wd.anal)[index], 
+                          function(x) strsplit(x," ")), "[[", 2))
+    names(df.tmp) <- append(t1, t2)
+  }
+  df.tmp <- melt(df.tmp, measure.vars=names(df.tmp))
+
+  ggplot(df.tmp,aes(x=variable, y = value))+
+    geom_boxplot() +
+    xlab("Date") +
+    ylab("Rainfall (mm)") +
+    ylim(0,80) +
+    theme_bw()
+}) 
+
+```
+
+
+### Average Rainfall in this area (October 2017 to June 2018)
+
+```{r}
+
+load("Allrain.RData")
+days1 <- seq(as.Date("2017-10-01"), as.Date("2018-06-26"), by="days")
+df2 <- data.frame(days = days1, rain = res.mat[,2])
+
+temp.data <- xts::as.xts(df2, order.by = df2$day)
+# create the graph
+dygraph(temp.data) %>%
+  dyAxis("y", label = "Rainfall (mm)", valueRange = c(0, 70)) %>%
+  dyOptions(colors = "red") %>% 
+  dyOptions(axisLineWidth = 1.5, fillGraph = TRUE, drawGrid = FALSE)
+
+
+```
